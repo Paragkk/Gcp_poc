@@ -1,10 +1,11 @@
 
 """
-DAG for Ingesting Data from CSV file and dumping in native tables
+DAG for Ingesting data
 """
 import os
 import time
 from urllib.parse import urlparse
+
 from airflow import models
 from airflow.operators.bash import BashOperator
 from airflow.providers.google.cloud.operators.bigquery import (
@@ -13,7 +14,6 @@ from airflow.providers.google.cloud.operators.bigquery import (
     BigQueryInsertJobOperator
 )
 from airflow.utils.dates import days_ago
-from airflow.providers.google.cloud.transfers.local_to_gcs import LocalFilesystemToGCSOperator
 from airflow.providers.google.cloud.sensors.gcs import GCSObjectsWithPrefixExistenceSensor
 from airflow.providers.google.cloud.transfers.gcs_to_gcs import GCSToGCSOperator
 from airflow.providers.google.cloud.operators.gcs import (
@@ -22,28 +22,27 @@ from airflow.providers.google.cloud.operators.gcs import (
 from airflow.utils.state import State
 from airflow.providers.google.cloud.operators.gcs import GCSListObjectsOperator
 
-PROJECT_ID = "gcp-project-id"
-BQ_LOCATION = "us-central1"
-DATASET_STAGE = "data_stage"
-DATASET_CURATED = "data_curated"
-TABLE_NAME = "app_data"
-PATH_TO_UPLOAD_FILE_PREFIX = "file_name_pattern"
-BUCKET_1 = "bucket_1"
-BUCKET_2 = "bucket_2"
-SCHEMA = [
-    {
-        "name": "signature",
-                "type": "STRING"
-    },
-    {
-        "name": "Alertmanager",
-                "type": "STRING"
-    },
-]
+# Variables to be changed Start
+TABLE_NAME = "table_name"
+PATH_TO_UPLOAD_FILE_PREFIX =  "file_prefix"
+# Variables to be changed End
 
-INSERT_ROWS_QUERY = (
+PROJECT_ID = "project_id"
+BQ_LOCATION = "us-central1"
+DATASET_STAGE = "dataset_stage"
+DATASET_CURATED = "dataset_curated"
+DATASET_REPORT = "dataset_report"
+BUCKET_1 = "bucket_name"
+BUCKET_2 = "bucket_name"
+SCHEMA = f"schema_files/SCHEMA_{TABLE_NAME}.json"
+
+INSERT_ROWS_QUERY_CURATED = (
     f"INSERT {DATASET_CURATED}.{TABLE_NAME}_curated "
     f"SELECT * FROM `{PROJECT_ID}.{DATASET_STAGE}.{TABLE_NAME}_ext` ;"
+)
+INSERT_ROWS_QUERY_REPORT = (
+    f"INSERT {DATASET_REPORT}.{TABLE_NAME}_report "
+    f"SELECT * FROM `{PROJECT_ID}.{DATASET_CURATED}.{TABLE_NAME}_curated` ;"
 )
 with models.DAG(
     f"jj_ingest_{TABLE_NAME}",
@@ -61,7 +60,7 @@ with models.DAG(
     )
     # [END howto_sensor_object_with_prefix_exists_task]
     list_bucket_files = GCSListObjectsOperator(
-        task_id="list_bucket_files", bucket=BUCKET_1, prefix="AIML-ETQ-Alert-Incident-moogsoft")
+        task_id="list_bucket_files", bucket=BUCKET_1, prefix=PATH_TO_UPLOAD_FILE_PREFIX)
 
     create_external_table = BigQueryCreateExternalTableOperator(
         task_id="create_external_table",
@@ -69,28 +68,47 @@ with models.DAG(
         source_objects=list_bucket_files.output,
         destination_project_dataset_table=f"{DATASET_STAGE}.{TABLE_NAME}_ext",
         skip_leading_rows=1,
-        schema_fields=SCHEMA,
+        allow_quoted_newlines =True ,
+        allow_jagged_rows=True,
+        schema_object=SCHEMA,
     )
 
     create_curated_table = BigQueryCreateEmptyTableOperator(
         task_id="create_curated_table",
         dataset_id=DATASET_CURATED,
         table_id=f"{TABLE_NAME}_curated",
-        schema_fields=SCHEMA,
+        gcs_schema_object=f"gs://{BUCKET_1}/{SCHEMA}",
         location=BQ_LOCATION,
     )
 
-    execute_insert_query = BigQueryInsertJobOperator(
+    execute_insert_curated = BigQueryInsertJobOperator(
         task_id="execute_insert_curated",
         configuration={
                 "query": {
-                    "query": INSERT_ROWS_QUERY,
+                    "query": INSERT_ROWS_QUERY_CURATED,
                     "useLegacySql": False,
                 }
         },
         location=BQ_LOCATION,
     )
+    create_reporting_table = BigQueryCreateEmptyTableOperator(
+        task_id="create_reporting_table",
+        dataset_id=DATASET_REPORT,
+        table_id=f"{TABLE_NAME}_report",
+        gcs_schema_object=f"gs://{BUCKET_1}/{SCHEMA}",
+        location=BQ_LOCATION,
+    )
 
+    execute_insert_report = BigQueryInsertJobOperator(
+        task_id="execute_insert_report",
+        configuration={
+                "query": {
+                    "query": INSERT_ROWS_QUERY_REPORT,
+                    "useLegacySql": False,
+                }
+        },
+        location=BQ_LOCATION,
+    )
     archieve_file = GCSToGCSOperator(
         task_id="archieve_file",
         source_bucket=BUCKET_1,
@@ -103,7 +121,7 @@ with models.DAG(
         task_id="delete_files", bucket_name=BUCKET_1, objects=list_bucket_files.output
     )
 
-gcs_object_with_prefix_exists >> list_bucket_files >> create_external_table >> create_curated_table >> execute_insert_query >> archieve_file >> delete_files
+gcs_object_with_prefix_exists >> list_bucket_files >> create_external_table >> create_curated_table >> execute_insert_curated >> create_reporting_table >> execute_insert_report >> archieve_file >> delete_files
 
 if __name__ == '__main__':
     dag.clear(dag_run_state=State.NONE)
